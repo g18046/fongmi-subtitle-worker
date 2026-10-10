@@ -26,7 +26,7 @@ export default {
 };
 
 /**
- * 处理搜索与抓取字幕列表（纯 fetch 版，秒级响应，绝不报错）
+ * 处理搜索与抓取字幕列表
  */
 async function handleGetSubs(keyword, request, env, ctx) {
     const startTime = Date.now();
@@ -55,7 +55,12 @@ async function handleGetSubs(keyword, request, env, ctx) {
 
         const subtitles = parseSubtitlesFromHtml(html);
         const targetSubtitles = subtitles.slice(0, 3);
-        const serverHost = `${new URL(request.url).protocol}//${new URL(request.url).host}`;
+        
+        // 自动适配当前请求的域名（优先使用你的自定义域名）
+        const hostHeader = request.headers.get('host');
+        const proto = request.headers.get('x-forwarded-proto') || 'https';
+        const serverHost = `${proto}://${hostHeader}`;
+
         const subsArray = [];
 
         for (const sub of targetSubtitles) {
