@@ -1,5 +1,3 @@
-import puppeteer from "@cloudflare/puppeteer";
-
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
@@ -28,7 +26,7 @@ export default {
 };
 
 /**
- * 处理搜索与抓取字幕列表
+ * 处理搜索与抓取字幕列表（纯 fetch 版，秒级响应，绝不报错）
  */
 async function handleGetSubs(keyword, request, env, ctx) {
     const startTime = Date.now();
@@ -39,36 +37,34 @@ async function handleGetSubs(keyword, request, env, ctx) {
         try {
             const cached = await env.SUB_KV.get(cacheKey, { type: "json" });
             if (cached) {
-                console.log(`[KV 缓存命中] 关键词: "${keyword}" | 耗时: ${Date.now() - startTime}ms`);
                 return Response.json({ subs: cached });
             }
-        } catch (e) {
-            console.error('[KV 读取失败]', e);
-        }
+        } catch (e) {}
     }
 
-    console.log(`[开始抓取] 关键词: "${keyword}"`);
-    const browser = await puppeteer.launch(env.MYBROWSER);
-    
     try {
-        const page = await browser.newPage();
         const searchUrl = `https://www.subtitlecat.com/index.php?search=${encodeURIComponent(keyword)}`;
+        const res = await fetch(searchUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        });
+        
+        if (!res.ok) throw new Error(`HTTP 错误: ${res.status}`);
+        const html = await res.text();
 
-        await page.goto(searchUrl, { waitUntil: 'load', timeout: 30000 });
-        const searchHtml = await page.content();
-        await page.close();
-
-        const subtitles = parseSubtitlesFromHtml(searchHtml);
+        const subtitles = parseSubtitlesFromHtml(html);
         const targetSubtitles = subtitles.slice(0, 3);
         const serverHost = `${new URL(request.url).protocol}//${new URL(request.url).host}`;
         const subsArray = [];
 
         for (const sub of targetSubtitles) {
-            const detailPage = await browser.newPage();
             try {
-                await detailPage.goto(sub.link, { waitUntil: 'load', timeout: 15000 });
-                const detailHtml = await detailPage.content();
-                await detailPage.close();
+                const detailRes = await fetch(sub.link, {
+                    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+                });
+                if (!detailRes.ok) continue;
+                const detailHtml = await detailRes.text();
 
                 const zhCnUrl = extractZhCnDownloadLink(detailHtml);
                 if (zhCnUrl) {
@@ -81,25 +77,18 @@ async function handleGetSubs(keyword, request, env, ctx) {
                         flag: 0
                     });
                 }
-            } catch (err) {
-                await detailPage.close().catch(() => {});
-            }
+            } catch (err) {}
         }
 
-        await browser.close();
-
-        // 异步写入 KV 缓存（有效期 30 分钟 = 1800 秒）
+        // 异步写入 KV 缓存（有效期 30 分钟）
         if (env.SUB_KV && subsArray.length > 0) {
             ctx.waitUntil(env.SUB_KV.put(cacheKey, JSON.stringify(subsArray), { expirationTtl: 1800 }));
         }
 
-        console.log(`[抓取成功] 关键词: "${keyword}" | 有效字幕: ${subsArray.length} 条 | 耗时: ${Date.now() - startTime}ms`);
         return Response.json({ subs: subsArray });
 
     } catch (error) {
-        await browser.close().catch(() => {});
-        console.error(`[抓取异常]`, error.message);
-        return Response.json({ subs: [] });
+        return Response.json({ subs: [], error: error.message }, { status: 500 });
     }
 }
 
@@ -109,37 +98,24 @@ async function handleGetSubs(keyword, request, env, ctx) {
 async function handleDownloadSub(targetUrl, env, ctx) {
     const cacheKey = `srt_${btoa(targetUrl).replace(/[/+=]/g, '_')}`;
 
-    // 优先读取 KV 中缓存的 SRT 文本
     if (env.SUB_KV) {
         try {
             const cachedSrt = await env.SUB_KV.get(cacheKey);
             if (cachedSrt) {
-                console.log(`[SRT KV缓存命中]`);
                 return new Response(cachedSrt, {
                     headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
                 });
             }
-        } catch (e) {
-            console.error('[SRT KV 读取失败]', e);
-        }
+        } catch (e) {}
     }
 
-    console.log(`[代理下载字幕] 目标地址: ${targetUrl}`);
-    const browser = await puppeteer.launch(env.MYBROWSER);
-    const page = await browser.newPage();
-
     try {
-        await page.goto('https://www.subtitlecat.com/', { waitUntil: 'domcontentloaded', timeout: 10000 });
-        const srtContent = await page.evaluate(async (url) => {
-            const res = await fetch(url);
-            if (!res.ok) throw new Error(`HTTP 错误! 状态码: ${res.status}`);
-            return await res.text();
-        }, targetUrl);
+        const res = await fetch(targetUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+        });
+        if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
+        const srtContent = await res.text();
 
-        await page.close();
-        await browser.close();
-
-        // 异步将 SRT 文本写入 KV（缓存 1 天 = 86400 秒）
         if (env.SUB_KV) {
             ctx.waitUntil(env.SUB_KV.put(cacheKey, srtContent, { expirationTtl: 86400 }));
         }
@@ -147,9 +123,7 @@ async function handleDownloadSub(targetUrl, env, ctx) {
         return new Response(srtContent, {
             headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
         });
-
     } catch (err) {
-        await browser.close().catch(() => {});
         return new Response("字幕下载失败: " + err.message, { status: 500 });
     }
 }
