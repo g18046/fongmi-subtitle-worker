@@ -3,22 +3,23 @@ export default {
         const url = new URL(request.url);
         const pathname = url.pathname;
 
-        // 1. 路由：获取字幕列表
+        // 1. 路由：获取字幕列表 (/api/subs?kw=...)
         if (pathname === '/api/subs') {
             const keyword = url.searchParams.get('kw') || url.searchParams.get('wd');
             if (!keyword) {
                 return Response.json({ error: "缺少 kw 或 wd 参数" }, { status: 400 });
             }
-            return await handleGetSubs(keyword, request, env, ctx);
+            return await handleGetSubs(keyword, request);
         }
 
-        // 2. 路由：代理下载并返回 SRT 字幕文本
-        if (pathname === '/api/download-sub') {
+        // 2. 路由：伪静态字幕下载接口 (例如: /api/sub/IPX-243/简体中文.srt)
+        if (pathname.startsWith('/api/sub/')) {
             const targetUrl = url.searchParams.get('url');
             if (!targetUrl) {
-                return new Response("缺少 targetUrl", { status: 400 });
+                return new Response("缺少目标地址", { status: 400 });
             }
-            return await handleDownloadSub(targetUrl, env, ctx);
+            const fullUrl = `https://www.subtitlecat.com${targetUrl}`;
+            return await handleDownloadSub(fullUrl);
         }
 
         return new Response("Not Found", { status: 404 });
@@ -26,27 +27,14 @@ export default {
 };
 
 /**
- * 处理搜索与抓取字幕列表
+ * 处理搜索与实时抓取字幕列表（无 KV 缓存，每次直连目标站）
  */
-async function handleGetSubs(keyword, request, env, ctx) {
-    const startTime = Date.now();
-    const cacheKey = `sub_list_${encodeURIComponent(keyword)}`;
-
-    // 优先读取 KV 缓存
-    if (env.SUB_KV) {
-        try {
-            const cached = await env.SUB_KV.get(cacheKey, { type: "json" });
-            if (cached) {
-                return Response.json({ subs: cached });
-            }
-        } catch (e) {}
-    }
-
+async function handleGetSubs(keyword, request) {
     try {
         const searchUrl = `https://www.subtitlecat.com/index.php?search=${encodeURIComponent(keyword)}`;
         const res = await fetch(searchUrl, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
         });
         
@@ -56,7 +44,6 @@ async function handleGetSubs(keyword, request, env, ctx) {
         const subtitles = parseSubtitlesFromHtml(html);
         const targetSubtitles = subtitles.slice(0, 3);
         
-        // 自动适配当前请求的域名（优先使用你的自定义域名）
         const hostHeader = request.headers.get('host');
         const proto = request.headers.get('x-forwarded-proto') || 'https';
         const serverHost = `${proto}://${hostHeader}`;
@@ -73,21 +60,18 @@ async function handleGetSubs(keyword, request, env, ctx) {
 
                 const zhCnUrl = extractZhCnDownloadLink(detailHtml);
                 if (zhCnUrl) {
-                    const originalSubtitleUrl = `https://www.subtitlecat.com${zhCnUrl}`;
+                    const cleanKeyword = keyword.replace(/[^a-zA-Z0-9-_]/g, '_');
+                    const prettyPath = `/api/sub/${cleanKeyword}/zh-CN.srt?url=${zhCnUrl}`;
+
                     subsArray.push({
-                        url: `${serverHost}/api/download-sub?url=${encodeURIComponent(originalSubtitleUrl)}`,
-                        name: `简体中文`,
+                        url: `${serverHost}${prettyPath}`,
+                        name: `简体中文 (${keyword})`,
                         lang: "zh-CN",
                         format: "text/srt",
                         flag: 0
                     });
                 }
             } catch (err) {}
-        }
-
-        // 异步写入 KV 缓存（有效期 30 分钟）
-        if (env.SUB_KV && subsArray.length > 0) {
-            ctx.waitUntil(env.SUB_KV.put(cacheKey, JSON.stringify(subsArray), { expirationTtl: 1800 }));
         }
 
         return Response.json({ subs: subsArray });
@@ -98,32 +82,15 @@ async function handleGetSubs(keyword, request, env, ctx) {
 }
 
 /**
- * 处理代理下载 .srt 文件
+ * 实时代理下载 .srt 文件
  */
-async function handleDownloadSub(targetUrl, env, ctx) {
-    const cacheKey = `srt_${btoa(targetUrl).replace(/[/+=]/g, '_')}`;
-
-    if (env.SUB_KV) {
-        try {
-            const cachedSrt = await env.SUB_KV.get(cacheKey);
-            if (cachedSrt) {
-                return new Response(cachedSrt, {
-                    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
-                });
-            }
-        } catch (e) {}
-    }
-
+async function handleDownloadSub(targetUrl) {
     try {
         const res = await fetch(targetUrl, {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
         });
         if (!res.ok) throw new Error(`下载失败 HTTP ${res.status}`);
         const srtContent = await res.text();
-
-        if (env.SUB_KV) {
-            ctx.waitUntil(env.SUB_KV.put(cacheKey, srtContent, { expirationTtl: 86400 }));
-        }
 
         return new Response(srtContent, {
             headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
